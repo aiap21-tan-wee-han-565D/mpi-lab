@@ -1,0 +1,14 @@
+cucumber
+tangerine
+persimmon
+plum
+fig
+lemon
+lime
+pineapple
+guava
+olive
+mulberry
+blackberry
+jackfruit
+eggplant

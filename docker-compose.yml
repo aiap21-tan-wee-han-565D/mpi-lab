@@ -1,0 +1,24 @@
+# docker-compose.yml
+version: "3.9"
+services:
+  n1:
+    build: .
+    container_name: n1
+    hostname: n1
+    networks: [mpi-net]
+    volumes:
+      - ./sshkeys:/sshkeys:ro
+      - ./work:/work
+
+  n2:
+    build: .
+    container_name: n2
+    hostname: n2
+    networks: [mpi-net]
+    volumes:
+      - ./sshkeys:/sshkeys:ro
+      - ./work:/work
+
+networks:
+  mpi-net:
+    driver: bridge   # private, isolated bridge network
