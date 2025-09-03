@@ -10,23 +10,40 @@
 #define SYNC (MAX_NUM_ENTRIES+3)
 #define SAFE (MAX_NUM_ENTRIES+4)
 
+
 typedef struct {
+  /*
+entries[]: array of char* to the actual word strings.
+In send_list: outgoing buffers to keep alive until ACK → then free.
+In recv_list: words you own (received or local) → later sorted/printed/freed.
+
+aux_var[]: per-slot integer metadata.
+In send_list: ack flags (0/1) used to detect when all sends are acknowledged.
+In recv_list: stores the message id/tag (or local idx) and doubles as the stable buffer for the nonblocking ACK send payload.*/
   int count;
   char *entries[MAX_NUM_ENTRIES];
 
-  /* In the send list, this variable stores whether the acknowledgement has
-   * been received. In the receive list, this variable stores the tag of the
-   * message. */
   int aux_var[MAX_NUM_ENTRIES];
 } list_t;
 
-/* Receive a message from another process. */
+/* Receive a message from another process. 
+MPI_Request req[] — This rank’s array where we store any new nonblocking sends we initiate here (e.g., ACKs).
+int *n_req — Counter (by pointer) of how many requests we’ve appended into req[] so far on this rank. We write the next MPI_Request at req[*n_req] and then do (*n_req)++.
+list_t *send_list — Bookkeeping for words this rank sent earlier this round.
+send_list->aux_var[i] = 0/1 → whether the i-th send has been ACKed.
+send_list->entries[i] → pointer to the sent buffer (freed on ACK).
+list_t *recv_list — Where we store words this rank owns locally (received from others or self).
+MPI_Status *status — Metadata produced by a prior MPI_Probe/MPI_Iprobe (contains MPI_SOURCE and MPI_TAG) for the message we’re about to consume.
+int safe[] — Per-rank flags used by the α-synchronizer; safe[src]=1 when we receive a SAFE control message from src.
+*/
 int receive_message(MPI_Request req[], int *n_req,
     list_t *send_list, list_t *recv_list, MPI_Status *status, int safe[])
 {
   if (status->MPI_TAG == ACK) {
     /* An acknowledgement is received. */
     int idx;
+    //idx is WORD(send_list->count) from ISend
+    // if target node receives an ack, means the idx is its own send list idx meaning send_list->entries[idx] is being acknolwedged i.e., sendlist->aux_var[idx] = 1
     MPI_Recv(&idx, 1, MPI_INT, status->MPI_SOURCE,
         status->MPI_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     send_list->aux_var[idx] = 1;
@@ -81,7 +98,7 @@ void synchronize(int *n_req, MPI_Request req[],
   MPI_Status status;
 
   safe[rank] = 1;
-  all_acked = all(send_list->count, send_list->aux_var);
+  all_acked = all(send_list->count, send_list->aux_var); // ) returns the logical AND of the first count integers in arr (treating non-zero as true)
 
   /* Get messages until the process is safe. */
   while (!all_acked) {
@@ -119,7 +136,25 @@ int find_dest(int nprocs, char *str, char *first_word[])
   return i-1;
 }
 
-/* Add a word to the list or send the word to the destiniation process */
+/* Add a word to the list or send the word to the destination process */
+/*Given a freshly read line str of length n_char, decide which MPI rank should own it.
+If the destination is a different rank, post a non-blocking send (MPI_Isend) and track that send so you can free the buffer when an ACK arrives.
+If the destination is this rank, just append the word locally to your receive list.
+It always returns 1 (the flag), which in this snippet isn’t used for control flow.
+
+MPI_Request req[]
+The caller’s array where this function will append new nonblocking send requests (MPI_Isend). Each new request handle is written into the next free slot.
+int *n_req: A counter (by pointer) for how many requests have been appended to req[] so far by this rank in this round. The call uses &req[(*n_req)++], which: stores the new MPI_Request at req[*n_req], then increments *n_req by 1.
+int rank:  This process’s MPI rank. Used to tell whether we’re the destination and thus should keep the word locally. int nprocs Total number of MPI processes. Passed to find_dest (via first_word) to figure out which rank owns the word.
+char *str:  The line read from the file (a dynamically allocated, NUL-terminated C string). Ownership rules: If we send it: keep the pointer in send_list so we can free it later when we get an ACK (the code frees it in receive_message upon ACK). If we keep it locally: store the pointer in recv_list (freed later when lists are destroyed/redistributed).
+int n_char:  The length returned by getline (bytes read). It usually includes the trailing '\n' if present. The function trims that newline (if (str[n_char-1] == '\n') ...) and then uses n_char+1 in MPI_Isend so the NUL terminator is sent too.
+int idx:  The index of this word within the current read batch (0…MAX_NUM_ENTRIES_PER_ROUND-1). If the word stays local, the code stashes idx into recv_list->aux_var[...]. (For received-from-remote words, aux_var stores the sender’s tag instead.) There’s no ACK for local words; storing idx just keeps a consistent “origin index” field.
+list_t *send_list:  Metadata for words we sent this round:
+entries[i] holds the pointer we sent,
+aux_var[i] is 0/1 for “ACK not received / received”.
+The index i is also encoded in the MPI tag for the send (via WORD(send_list->count)), so the receiver can return it in an ACK and we know which slot to mark as acked.
+list_t *recv_list : Where we accumulate locally owned words (either self-kept or received from others).
+char *first_word[] : An array (length = nprocs) of threshold strings that define the alphabetical bins per rank. find_dest(nprocs, str, first_word) uses this to pick the destination rank for str.*/
 int add_word(MPI_Request req[], int *n_req, int rank, int nprocs,
     char *str, int n_char, int idx,
     list_t *send_list, list_t *recv_list, char *first_word[])
@@ -129,12 +164,26 @@ int add_word(MPI_Request req[], int *n_req, int rank, int nprocs,
   dest = find_dest(nprocs, str, first_word);
 
   if (dest != rank) { // Send to the corresponding process
+    // &req[(*n_req)++] means Take the address of req[k] (so MPI can write into it), where k is the current value of *n_req. 
+    // After using that index, increment *n_req by 1 (post-increment), so the next request will go into the next slot.
+    /*str: pointer to the send buffer (a C string for one word).
+n_char+1: number of elements to send. getline gave you n_char bytes read (usually ends with '\n'). The code sends +1 so the NUL terminator '\0' is transmitted too (receiver can treat it as a proper C string).
+MPI_CHAR: datatype for each element in the buffer.
+dest: destination rank.
+WORD(send_list->count): the tag. Here WORD(i) is just i, so the tag encodes the index of this send in the sender’s send_list. The receiver stores this tag and sends it back in an ACK so the sender knows which entry got acknowledged.
+MPI_COMM_WORLD: communicator.
+&req[(*n_req)++]: where to store the MPI request handle for this nonblocking send, then post-increment *n_req.
+The request handle lands in req[*n_req].
+After storing it, *n_req is incremented by 1.*/
     MPI_Isend(str, n_char+1, MPI_CHAR, dest,
         WORD(send_list->count), MPI_COMM_WORLD, &req[(*n_req)++]);
+/*You stash the pointer you just sent in send_list->entries[...] and mark aux_var[...] = 0 (meaning “not yet acknowledged”).
+This is critical: because it’s an Isend, the buffer must remain valid until the request completes. 
+Keeping the pointer lets you free(...) it on ACK (your receive_message does exactly that).*/
     send_list->entries[send_list->count] = str;
     send_list->aux_var[send_list->count] = 0;
     send_list->count++;
-  } else { // Add the word to the list
+  } else { // Add the word to the list because it is your own word
     recv_list->entries[recv_list->count] = str;
     recv_list->aux_var[recv_list->count] = idx;
     recv_list->count++;
@@ -143,7 +192,20 @@ int add_word(MPI_Request req[], int *n_req, int rank, int nprocs,
 }
 
 /**
- * Check incoming messages.
+ * It drains all currently pending MPI messages for this rank without blocking.
+
+Uses MPI_Iprobe in a loop:
+flag is set to 1 if at least one message is waiting (from any source / any tag), else 0.
+When flag==1, status is filled with the metadata (source, tag, count-able later).
+For each pending message, it calls receive_message(...), which:
+If it’s a WORD: does a matching MPI_Recv, appends the word to recv_list, and sends an ACK with MPI_Isend (so a new request gets appended to req[], and *n_req increments).
+If it’s an ACK: marks the corresponding send as acknowledged in send_list and frees the sent buffer.
+If it’s SYNC or SAFE: consumes the control message; for SAFE, it also sets safe[src]=1. In both cases it returns 1 to signal “start/participate in synchronizer.”
+start_synchronizer OR-accumulates those return values so if any control message (SYNC/SAFE) was seen during this drain, the function returns 1; otherwise 0.
+Net effect: after check_incoming_msg returns, your process has:
+Responded to all waiting messages (acked words, recorded acks, absorbed control msgs),
+Possibly queued some ACK sends (tracked in req[], counted by *n_req),
+Learned whether it should stop its current work and enter the synchronization phase (return 1).
  */
 int check_incoming_msg(MPI_Request req[], int *n_req,
     list_t *send_list, list_t *recv_list, int safe[])
@@ -151,7 +213,7 @@ int check_incoming_msg(MPI_Request req[], int *n_req,
   int start_synchronizer = 0, flag = 1;
   while (flag) {
     MPI_Status status;
-    MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &status);
+    MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &status); // flag gets modifed here. flag = 1 → at least one pending message (from any source/tag). flag = 0 → no pending messages right now.
     if (flag) {
       start_synchronizer |= receive_message(req, n_req,
           send_list, recv_list, &status, safe);
@@ -161,8 +223,19 @@ int check_incoming_msg(MPI_Request req[], int *n_req,
 }
 
 /*
- * Read words from the file and send them to corresponding processes. Return
- * the number of requests.
+ * Read words from the file and send them to corresponding processes. Return the number of requests.
+ * add_entries reads up to MAX_NUM_ENTRIES_PER_ROUND lines (“words”) from a file and, for each line, hands the work off to the right MPI process (non-blocking).
+ *  While it’s doing that, it also checks if any peer has asked to “synchronize” the round. If a sync request is seen, 
+ * it stops early and returns the number of in-flight MPI requests so the caller can MPI_Wait* on them. 
+ * If it finishes the per-round budget without hitting EOF, it proactively asks everyone else to synchronize by sending a zero-byte “SYNC” control message.
+ * 
+ * Concretely, across the whole program there are three ways you’ll end up starting the synchronizer:
+ * You reached the per-round cap (read 5 lines by default) and not EOF
+ * → you proactively broadcast SYNC to everyone at the end of the loop body in add_entries and then return to run synchronize(...).
+ * A peer reached the cap first and sent SYNC while you were still reading
+ * → your immediate check_incoming_msg detects it, sets start_synchronizer=1, prints the message, returns early from add_entries, and you call synchronize(...).
+ * A peer already entered/finished synchronization and sent SAFE
+ * → same as above: you detect SAFE in check_incoming_msg, set start_synchronizer=1, and return to start your synchronizer.
  */
 int add_entries(MPI_Request req[], int rank, int nprocs,
     list_t *send_list, list_t *recv_list, FILE *fp, int safe[], char *first_word[])
@@ -381,7 +454,23 @@ int main(int argc, char *argv[])
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   send_list.count = recv_list.count = 0;
 
-  /* Task distribution */
+  /* Task distribution 
+  *and first_word[i][0] = 'a' + start[i].
+
+Concrete examples
+
+nprocs = 4
+quotient=6, remainder=2 → sizes: 7, 7, 6, 6
+Starts (as letters):
+
+i=0: 'a' + 0*(7) = 'a'
+
+i=1: 'a' + 1*(7) = 'h'
+
+i=2: 'a' + 2*6 + 2 = 'o'
+
+i=3: 'a' + 3*6 + 2 = 'u'
+Bins: [a..g], [h..n], [o..t], [u..z].*/
   first_word = (char **)malloc(nprocs * sizeof(char *));
   int quotient = 26 / nprocs, remainder = 26 % nprocs;
   for (i = 0; i < remainder; i++) {
