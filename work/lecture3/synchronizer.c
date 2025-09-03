@@ -213,6 +213,8 @@ int check_incoming_msg(MPI_Request req[], int *n_req,
   int start_synchronizer = 0, flag = 1;
   while (flag) {
     MPI_Status status;
+    //why use iprobe here instead of probe: check_incoming_msg is a non-blocking mailbox drain that’s called in the hot path while you’re still doing work, 
+    //whereas the other places are points where you must wait for messages to progress—so blocking is fine (and better).
     MPI_Iprobe(MPI_ANY_SOURCE, MPI_ANY_TAG, MPI_COMM_WORLD, &flag, &status); // flag gets modifed here. flag = 1 → at least one pending message (from any source/tag). flag = 0 → no pending messages right now.
     if (flag) {
       start_synchronizer |= receive_message(req, n_req,
@@ -311,12 +313,17 @@ void separate_words(const char *str, int len, list_t *list)
 /*
  * Redistribute the words such that each process has roughly the same number of
  * words.
+ * list_t *recv_list — Your rank’s current list of words (pointers to char*). This function will replace its contents with a balanced subset.
+ * int rank — Your MPI rank (who you are).
+ * int nprocs — Total number of MPI processes.
  */
 void redistribute_words(list_t *recv_list, int rank, int nprocs)
 {
   /* Gather the counts of words from each process. */
   int *count = (int *)malloc((nprocs+1) * sizeof(int));
   count[0] = 0;
+  //count[0] is left untouched, and the gathered results land in count[1] through count[size-1+1].
+  // count[i] = number of words owned by rank i-1, and yes all_gather will order them by rank.
   MPI_Allgather(&recv_list->count, 1, MPI_INT, count+1, 1, MPI_INT, MPI_COMM_WORLD);
   for (int i = 2; i <= nprocs; i++) count[i] += count[i-1];
 
@@ -337,9 +344,13 @@ void redistribute_words(list_t *recv_list, int rank, int nprocs)
     end = start + quotient + (i < remainder ? 1 : 0);
     if (i != rank) {
       /* Check if we need to send any words to process i. If so, send the words. */
-      int first = start > count[rank] ? start : count[rank];
-      int last = end < count[rank+1] ? end : count[rank+1];
+      int first = start > count[rank] ? start : count[rank]; // max(start, count[rank])
+      int last = end < count[rank+1] ? end : count[rank+1]; // min(end, count[rank+1])
+      // we are checking if there is an overlap between [start, end) and [count[rank], count[rank+1])
+      // i.e. whether [max(start, count[rank]), min(end, count[rank+1])) has positive length
       if (last > first) {
+        // if there is an overlap, we need to send words to process i
+        // You pack that contiguous subrange of your local list into one buffer (join_strings uses '\0' separators) and send exactly one message to i
         int size;
         str[i] = join_strings(recv_list, first - count[rank], last - count[rank], &size);
         MPI_Isend(str[i], size, MPI_CHAR, i, 0, MPI_COMM_WORLD, &send_req[i]);
@@ -349,6 +360,11 @@ void redistribute_words(list_t *recv_list, int rank, int nprocs)
       int first = start > count[i] ? start : count[i];
       int last = end < count[i+1] ? end : count[i+1];
       for (int j = first; j < last; j++) {
+        // here you are looking at the overlap between [start, end) (the target slice for rank i) and [count[i], count[i+1]) (current block owned by rank i)
+        // j-count[i] is the local index of the overlap
+        // e.g., if count[i]=8, count[i+1]=15, and your target overlap is [first,last)=[10,14), 
+        // then j takes values 10,11,12,13 (global indices in the overlap),
+        // and j-count[i] takes values 2,3,4,5 (local indices in recv_list)
         new_list.entries[new_list.count++] = recv_list->entries[j-count[i]];
         recv_list->entries[j-count[i]] = NULL;
       }
